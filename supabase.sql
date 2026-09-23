@@ -1,22 +1,34 @@
 -- SGrifas: execute TODO este arquivo no Supabase > SQL Editor > New query > Run
 create extension if not exists pgcrypto;
 create table if not exists public.profiles(id uuid primary key references auth.users(id) on delete cascade,email text,role text not null default 'user' check(role in('user','admin')),created_at timestamptz default now());
+alter table public.profiles enable row level security;
 create table if not exists public.raffles(id uuid primary key default gen_random_uuid(),title text not null,description text,image_url text,type text not null check(type in('selectable','random')),total_numbers int not null check(total_numbers between 1 and 1000000),price numeric(12,2) not null check(price>=0),status text not null default 'draft' check(status in('draft','active','finished')),rules text,created_at timestamptz default now());
+alter table public.raffles enable row level security;
 create table if not exists public.orders(id uuid primary key default gen_random_uuid(),code text unique not null,user_id uuid not null references public.profiles(id),raffle_id uuid not null references public.raffles(id),quantity int not null,total numeric(12,2) not null,status text not null default 'pending' check(status in('pending','paid','cancelled','expired')),expires_at timestamptz not null,created_at timestamptz default now());
+alter table public.orders enable row level security;
 create table if not exists public.tickets(id bigint generated always as identity primary key,raffle_id uuid not null references public.raffles(id),order_id uuid not null references public.orders(id) on delete cascade,user_id uuid not null references public.profiles(id),number int not null,status text not null default 'reserved' check(status in('reserved','paid','cancelled','expired')),created_at timestamptz default now(),unique(raffle_id,number));
+alter table public.tickets enable row level security;
 create or replace function public.handle_new_user() returns trigger language plpgsql security definer set search_path=public as $$begin insert into public.profiles(id,email) values(new.id,new.email) on conflict(id) do nothing;return new;end$$;
 drop trigger if exists on_auth_user_created on auth.users;create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.handle_new_user();
 create or replace function public.is_admin() returns boolean language sql stable security definer set search_path=public as $$select exists(select 1 from profiles where id=auth.uid() and role='admin')$$;
 create or replace function public.release_expired() returns void language plpgsql security definer set search_path=public as $$begin update tickets t set status='expired' from orders o where t.order_id=o.id and o.status='pending' and o.expires_at<now();update orders set status='expired' where status='pending' and expires_at<now();delete from tickets where status in('expired','cancelled');end$$;
 create or replace function public.create_order(p_raffle_id uuid,p_numbers int[] default null,p_quantity int default null) returns uuid language plpgsql security definer set search_path=public as $$declare r raffles%rowtype;q int;nums int[];oid uuid;num int;begin if auth.uid() is null then raise exception 'Faça login';end if;perform release_expired();select * into r from raffles where id=p_raffle_id and status='active' for update;if not found then raise exception 'Campanha indisponível';end if;if r.type='selectable' then nums:=p_numbers;q:=coalesce(array_length(nums,1),0);if q<1 then raise exception 'Selecione números';end if;if exists(select 1 from unnest(nums) n where n<1 or n>r.total_numbers) then raise exception 'Número inválido';end if;if (select count(distinct n) from unnest(nums)n)<>q then raise exception 'Números repetidos';end if;else q:=p_quantity;if q is null or q<1 or q>100 then raise exception 'Quantidade inválida';end if;select array_agg(n order by random()) into nums from (select n from generate_series(1,r.total_numbers)n where not exists(select 1 from tickets t where t.raffle_id=r.id and t.number=n) limit q)s;if coalesce(array_length(nums,1),0)<q then raise exception 'Números insuficientes';end if;end if;insert into orders(code,user_id,raffle_id,quantity,total,expires_at) values(upper(substr(replace(gen_random_uuid()::text,'-',''),1,10)),auth.uid(),r.id,q,r.price*q,now()+interval '15 minutes') returning id into oid;foreach num in array nums loop begin insert into tickets(raffle_id,order_id,user_id,number) values(r.id,oid,auth.uid(),num);exception when unique_violation then raise exception 'Um número acabou de ser reservado. Tente novamente.';end;end loop;return oid;end$$;
 create or replace function public.admin_set_order_status(p_order_id uuid,p_status text) returns void language plpgsql security definer set search_path=public as $$begin if not is_admin() then raise exception 'Sem permissão';end if;if p_status not in('paid','cancelled') then raise exception 'Status inválido';end if;update orders set status=p_status where id=p_order_id;if p_status='paid' then update tickets set status='paid' where order_id=p_order_id;else update tickets set status='cancelled' where order_id=p_order_id;delete from tickets where order_id=p_order_id and status='cancelled';end if;end$$;
-alter table profiles enable row level security;alter table raffles enable row level security;alter table orders enable row level security;alter table tickets enable row level security;
+
 drop policy if exists profiles_self on profiles;create policy profiles_self on profiles for select using(id=auth.uid() or is_admin());
 drop policy if exists raffles_public on raffles;create policy raffles_public on raffles for select using(status='active' or is_admin());
 drop policy if exists raffles_admin_insert on raffles;create policy raffles_admin_insert on raffles for insert with check(is_admin());
 drop policy if exists raffles_admin_update on raffles;create policy raffles_admin_update on raffles for update using(is_admin()) with check(is_admin());
 drop policy if exists orders_self on orders;create policy orders_self on orders for select using(user_id=auth.uid() or is_admin());
-drop policy if exists tickets_read on tickets;create policy tickets_read on tickets for select using(true);
+drop policy if exists tickets_read on tickets;
+drop policy if exists tickets_self on tickets;create policy tickets_self on tickets for select using(user_id=auth.uid() or is_admin());
+
+create or replace function public.get_taken_numbers(p_raffle_id uuid) returns table(number int) language sql stable security definer set search_path=public as $$
+select t.number from public.tickets t join public.raffles r on r.id=t.raffle_id where t.raffle_id=p_raffle_id and r.status='active' and t.status in('reserved','paid')
+$$;
+revoke all on function public.get_taken_numbers(uuid) from public;
+grant execute on function public.get_taken_numbers(uuid) to anon, authenticated;
+
 grant execute on function create_order(uuid,int[],int) to authenticated;grant execute on function admin_set_order_status(uuid,text) to authenticated;
 -- APÓS criar sua primeira conta pelo site, torne-a admin substituindo o e-mail abaixo:
 -- update public.profiles set role='admin' where email='SEU_EMAIL@EXEMPLO.COM';
